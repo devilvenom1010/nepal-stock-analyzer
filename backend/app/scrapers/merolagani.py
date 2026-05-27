@@ -63,24 +63,80 @@ class MerolaganiScraper(BaseScraper):
             return None
 
     async def _fetch_company_sector(self, symbol: str, sem: asyncio.Semaphore) -> tuple[str, Optional[str]]:
-        """Fetch the actual sector name for a symbol from its details page."""
+        """Fetch the actual sector name for a symbol from its details page.
+        
+        Retries up to 3 times with exponential backoff to handle transient
+        server-side rate limits or connection resets.
+        """
+        url = f"{self.BASE_URL}/CompanyDetail.aspx?symbol={symbol}"
+        headers = {
+            **dict(self.client.headers),
+            "Referer": f"{self.BASE_URL}/StockQuote.aspx",
+        }
+        max_retries = 3
+
         async with sem:
-            url = f"{self.BASE_URL}/CompanyDetail.aspx?symbol={symbol}"
-            try:
-                response = await self.client.get(url)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "lxml")
-                
-                sector = None
-                th = soup.find(lambda tag: tag.name == "th" and "Sector" in tag.get_text())
-                if th:
-                    td = th.find_next_sibling("td")
-                    if td:
-                        sector = td.get_text(strip=True)
-                return symbol, sector
-            except Exception as e:
-                logger.warning(f"[merolagani] Failed to fetch sector for {symbol}: {e}")
-                return symbol, None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = await self.client.get(url, headers=headers)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.text, "lxml")
+
+                    sector = None
+
+                    # Strategy 1: <th> sibling containing "Sector"
+                    th = soup.find(
+                        lambda tag: tag.name == "th"
+                        and "Sector" in tag.get_text(strip=True)
+                    )
+                    if th:
+                        td = th.find_next_sibling("td")
+                        if td:
+                            sector = td.get_text(strip=True)
+
+                    # Strategy 2: table row where first cell is "Sector"
+                    if not sector:
+                        for row in soup.find_all("tr"):
+                            cells = row.find_all(["th", "td"])
+                            if len(cells) >= 2 and "sector" in cells[0].get_text(strip=True).lower():
+                                sector = cells[1].get_text(strip=True)
+                                break
+
+                    if sector:
+                        logger.debug(f"[merolagani] Sector for {symbol}: {sector}")
+                    else:
+                        logger.warning(
+                            f"[merolagani] Sector field not found in page for {symbol} "
+                            f"(page title: {soup.title.string if soup.title else 'N/A'})"
+                        )
+
+                    return symbol, sector
+
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                    logger.warning(
+                        f"[merolagani] Attempt {attempt}/{max_retries} failed for {symbol} "
+                        f"({type(e).__name__}: {e}). "
+                        + ("Retrying..." if attempt < max_retries else "Giving up.")
+                    )
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
+                    else:
+                        return symbol, None
+
+                except httpx.HTTPStatusError as e:
+                    logger.warning(
+                        f"[merolagani] HTTP {e.response.status_code} fetching sector for {symbol}: {e}"
+                    )
+                    return symbol, None
+
+                except Exception as e:
+                    logger.warning(
+                        f"[merolagani] Unexpected error fetching sector for {symbol} "
+                        f"({type(e).__name__}: {e})"
+                    )
+                    return symbol, None
+
+        return symbol, None
 
     # Class-level cache shared across all instances
     _today_cache: list[dict] = []
@@ -161,7 +217,7 @@ class MerolaganiScraper(BaseScraper):
         # ── Resolve Sectors Concurrently (Only if requested) ──────────
         if resolve_sectors and stocks:
             logger.info(f"[merolagani] Resolving sectors for {len(stocks)} stocks...")
-            sem = asyncio.Semaphore(15)  # Safe limit to avoid server-side rate limits
+            sem = asyncio.Semaphore(5)  # Conservative limit to avoid server-side rate limits
             tasks = [self._fetch_company_sector(s["symbol"], sem) for s in stocks]
             sector_results = await asyncio.gather(*tasks)
             
