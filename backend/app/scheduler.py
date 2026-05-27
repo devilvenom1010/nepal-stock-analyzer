@@ -1,12 +1,5 @@
 # backend/app/scheduler.py
-#
-# APScheduler job definitions:
-#   - run_daily_scrape()      → runs every evening at 4:30 PM Nepal time
-#   - run_historical_scrape() → called once on first setup for 30-day backfill
-#
-# Both can also be triggered manually via POST /api/v1/scrape/trigger
-# and POST /api/v1/scrape/historical from the React frontend.
-
+import asyncio
 import logging
 from datetime import datetime, date
 from typing import Optional
@@ -24,67 +17,52 @@ from .scrapers.merolagani  import MerolaganiScraper
 logger    = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="Asia/Kathmandu")
 
-
 # ─────────────────────────────────────────────────────────────────
-#  Main daily job
+#  Daily scrape (runs at 4:30 PM Nepal time every trading day)
 # ─────────────────────────────────────────────────────────────────
 
 async def run_daily_scrape() -> dict:
-    """
-    Scrapes today's price and fundamentals from all three sources.
-    Priority for conflict resolution: nepsealpha > sharesansar > merolagani.
-    Runs automatically every day at 4:30 PM Nepal time (market closes at 3 PM).
-    Can also be triggered manually from the frontend.
-    """
     logger.info("=== Daily scrape started ===")
-    db       = SessionLocal()
-    started  = datetime.now()
-    total    = 0
-    errors   = []
+    db      = SessionLocal()
+    started = datetime.now()
+    total   = 0
+    errors  = []
 
-    # Source priority order: first source to write a (symbol, date) wins.
-    # Subsequent sources skip the row due to the UNIQUE constraint.
+    # Priority: nepsealpha first (best real-time data), others fill gaps
     scrapers = [
-        NepseAlphaScraper(),    # Best real-time data — goes first
-        SharesansarScraper(),   # Good fundamentals data — goes second
-        MerolaganiScraper(),    # Additional fundamentals — fills gaps
+        NepseAlphaScraper(),
+        SharesansarScraper(),
+        MerolaganiScraper(),
     ]
 
     for scraper in scrapers:
-        src_name = scraper.SOURCE_NAME
+        src = scraper.SOURCE_NAME
         try:
             symbols = await scraper.scrape_all_symbols()
             count   = 0
-
             for symbol in symbols:
                 try:
                     data = await scraper.scrape_daily(symbol)
-                    if not data:
-                        continue
-
-                    _upsert_price(db, data)
-                    _upsert_fundamentals(db, data)
-                    count += 1
-
-                    # Commit in batches of 50 to avoid giant transactions
-                    if count % 50 == 0:
+                    if data:
+                        _upsert_price(db, data)
+                        _upsert_fundamentals(db, data)
+                        count += 1
+                    if count % 50 == 0 and count > 0:
                         db.commit()
-                        logger.debug(f"[{src_name}] {count} rows committed so far")
-
+                    # Small polite delay between requests
+                    await asyncio.sleep(0.2)
                 except Exception as sym_err:
-                    logger.warning(f"[{src_name}] Error on {symbol}: {sym_err}")
+                    logger.warning(f"[{src}] {symbol}: {sym_err}")
 
             db.commit()
             total += count
-            _log_run(db, src_name, "success", count, started)
-            logger.info(f"[{src_name}] Done — {count} records")
-
+            _log_run(db, src, "success", count, started)
+            logger.info(f"[{src}] Done — {count} records")
         except Exception as e:
             db.rollback()
-            errors.append(f"{src_name}: {e}")
-            _log_run(db, src_name, "failed", 0, started, str(e))
-            logger.error(f"[{src_name}] Scraper failed: {e}")
-
+            errors.append(f"{src}: {e}")
+            _log_run(db, src, "failed", 0, started, str(e))
+            logger.error(f"[{src}] Scraper failed: {e}")
         finally:
             await scraper.close()
 
@@ -95,93 +73,56 @@ async def run_daily_scrape() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-#  Historical backfill job (run once on first setup)
+#  Historical backfill (run once on first setup)
 # ─────────────────────────────────────────────────────────────────
 
 async def run_historical_scrape(days: int = 30) -> dict:
-    """
-    Backfill the last `days` calendar days of OHLCV data.
-    Uses NepseAlpha as the primary source (best history API).
-    Sharesansar is used as a fallback for symbols NepseAlpha misses.
-    """
     logger.info(f"=== Historical scrape started ({days} days) ===")
     db      = SessionLocal()
     started = datetime.now()
-    total   = 0
+    grand   = 0
 
-    # Phase 1 — NepseAlpha (has a clean JSON history API)
-    scraper = NepseAlphaScraper()
-    try:
-        symbols = await scraper.scrape_all_symbols()
-        for symbol in symbols:
-            try:
-                records = await scraper.scrape_historical(symbol, days=days)
-                for r in records:
-                    _upsert_price(db, r)
-                    total += 1
-                if total % 200 == 0 and total > 0:
-                    db.commit()
-            except Exception as e:
-                logger.warning(f"[nepsealpha historical] {symbol}: {e}")
-        db.commit()
-        _log_run(db, "nepsealpha_historical", "success", total, started)
-    except Exception as e:
-        db.rollback()
-        _log_run(db, "nepsealpha_historical", "failed", 0, started, str(e))
-        logger.error(f"NepseAlpha historical scrape failed: {e}")
-    finally:
-        await scraper.close()
+    # Phase order: NepseAlpha (best API) → Sharesansar → Merolagani (fills gaps)
+    phases = [
+        (NepseAlphaScraper(),  "nepsealpha_historical",  True),
+        (SharesansarScraper(), "sharesansar_historical", False),
+        (MerolaganiScraper(),  "merolagani_historical",  False),
+    ]
 
-    # Phase 2 — Merolagani historical (fills any gaps)
-    m_scraper = MerolaganiScraper()
-    m_total   = 0
-    try:
-        m_symbols = await m_scraper.scrape_all_symbols()
-        for symbol in m_symbols:
-            try:
-                records = await m_scraper.scrape_historical(symbol, days=days)
-                for r in records:
-                    # Only insert if NepseAlpha/Merolagani didn't already cover this day
-                    if not _price_exists(db, r["symbol"], r["date"]):
-                        _upsert_price(db, r)
-                        m_total += 1
-            except Exception as e:
-                logger.warning(f"[merolagani historical] {symbol}: {e}")
-        db.commit()
-        _log_run(db, "merolagani_historical", "success", m_total, started)
-    except Exception as e:
-        db.rollback()
-        _log_run(db, "merolagani_historical", "failed", 0, started, str(e))
-    finally:
-        await m_scraper.close()
+    for scraper, log_name, is_primary in phases:
+        src_total = 0
+        try:
+            symbols = await scraper.scrape_all_symbols()
+            logger.info(f"[{log_name}] {len(symbols)} symbols to process")
 
-    # Phase 3 — Sharesansar historical table (fills any gaps)
-    ss_scraper = SharesansarScraper()
-    ss_total   = 0
-    try:
-        ss_symbols = await ss_scraper.scrape_all_symbols()
-        for symbol in ss_symbols:
-            try:
-                records = await ss_scraper.scrape_historical(symbol, days=days)
-                for r in records:
-                    # Only insert if not already covered
-                    if not _price_exists(db, r["symbol"], r["date"]):
-                        _upsert_price(db, r)
-                        ss_total += 1
-            except Exception as e:
-                logger.warning(f"[sharesansar historical] {symbol}: {e}")
-        db.commit()
-        _log_run(db, "sharesansar_historical", "success", ss_total, started)
-    except Exception as e:
-        db.rollback()
-        _log_run(db, "sharesansar_historical", "failed", 0, started, str(e))
-    finally:
-        await ss_scraper.close()
+            for symbol in symbols:
+                try:
+                    records = await scraper.scrape_historical(symbol, days=days)
+                    for r in records:
+                        # Non-primary sources only fill missing days
+                        if is_primary or not _price_exists(db, r["symbol"], r["date"]):
+                            _upsert_price(db, r)
+                            src_total += 1
+                    if src_total % 200 == 0 and src_total > 0:
+                        db.commit()
+                    await asyncio.sleep(0.3)  # polite delay
+                except Exception as e:
+                    logger.warning(f"[{log_name}] {symbol}: {e}")
+
+            db.commit()
+            grand += src_total
+            _log_run(db, log_name, "success", src_total, started)
+            logger.info(f"[{log_name}] Done — {src_total} records")
+        except Exception as e:
+            db.rollback()
+            _log_run(db, log_name, "failed", 0, started, str(e))
+            logger.error(f"[{log_name}] Failed: {e}")
+        finally:
+            await scraper.close()
 
     db.close()
-    grand_total = total + m_total + ss_total
-    logger.info(f"=== Historical scrape complete — {grand_total} total records ===")
-    return {"status": "done", "records_saved": grand_total}
+    logger.info(f"=== Historical scrape complete — {grand} total records ===")
+    return {"status": "done", "records_saved": grand}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -189,17 +130,9 @@ async def run_historical_scrape(days: int = 30) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 def _upsert_price(db: Session, data: dict) -> None:
-    """
-    Insert a price row. Skip silently if (symbol, trade_date) already exists.
-    We use try/except rather than ON CONFLICT because MSSQL's merge syntax
-    is verbose — and for a daily scraper, duplicates are rare enough that
-    catching the IntegrityError is cleaner.
-    """
     close = data.get("close") or data.get("close_price")
     if not close:
         return
-
-    # Normalise key names (scrapers may use 'close' or 'close_price')
     try:
         row = StockPrice(
             symbol      = data["symbol"].upper(),
@@ -214,13 +147,12 @@ def _upsert_price(db: Session, data: dict) -> None:
             source      = data.get("source"),
         )
         db.add(row)
-        db.flush()  # let the DB check the unique constraint immediately
+        db.flush()
     except Exception:
-        db.rollback()   # duplicate or bad data — silently skip
+        db.rollback()
 
 
 def _upsert_fundamentals(db: Session, data: dict) -> None:
-    """Insert fundamentals row if any fundamental fields are present."""
     fund_keys = ["market_cap", "pe_ratio", "eps", "book_value", "week52_high", "week52_low"]
     if not any(data.get(k) for k in fund_keys):
         return
@@ -243,7 +175,6 @@ def _upsert_fundamentals(db: Session, data: dict) -> None:
 
 
 def _price_exists(db: Session, symbol: str, date_str: str) -> bool:
-    """Return True if we already have a price row for this symbol + date."""
     d = _to_date(date_str)
     return db.query(StockPrice).filter(
         StockPrice.symbol     == symbol.upper(),
@@ -251,27 +182,19 @@ def _price_exists(db: Session, symbol: str, date_str: str) -> bool:
     ).first() is not None
 
 
-def _log_run(db: Session, source: str, status: str, records: int,
-             started: datetime, error: Optional[str] = None) -> None:
+def _log_run(db, source, status, records, started, error=None):
     log = ScrapeLog(
-        source        = source,
-        status        = status,
-        records_saved = records,
-        error_message = error,
-        started_at    = started,
+        source=source, status=status, records_saved=records,
+        error_message=error, started_at=started,
     )
     db.add(log)
     db.commit()
 
 
 def _to_date(val):
-    """Accept a date object, ISO string, or datetime — return a date."""
-    if isinstance(val, date):
-        return val
-    if isinstance(val, datetime):
-        return val.date()
-    if isinstance(val, str):
-        return date.fromisoformat(val[:10])
+    if isinstance(val, date): return val
+    if isinstance(val, datetime): return val.date()
+    if isinstance(val, str): return date.fromisoformat(val[:10])
     return val
 
 
@@ -287,17 +210,12 @@ def _to_int(val) -> Optional[int]:
 # ─────────────────────────────────────────────────────────────────
 
 def start_scheduler():
-    """
-    Register the daily scrape job.
-    Nepal Stock Exchange closes at 3:00 PM NPT.
-    We run at 4:30 PM to give sites time to publish end-of-day data.
-    """
     scheduler.add_job(
         run_daily_scrape,
         trigger=CronTrigger(hour=16, minute=30, timezone="Asia/Kathmandu"),
         id="daily_scrape",
         replace_existing=True,
-        misfire_grace_time=3600,   # run even if server was down for up to 1 hour
+        misfire_grace_time=3600,
     )
     scheduler.start()
     logger.info("Scheduler started — daily scrape at 16:30 Nepal time")

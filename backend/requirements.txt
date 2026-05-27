@@ -6,28 +6,28 @@ uvicorn[standard]==0.30.6
 
 # ── Database ───────────────────────────────────────────────────────
 sqlalchemy==2.0.36
-pyodbc==5.2.0           # MSSQL ODBC driver bridge
+pyodbc==5.2.0
 
 # ── HTTP & Scraping ────────────────────────────────────────────────
-httpx==0.27.2           # async HTTP (replaces requests)
+httpx==0.27.2
 beautifulsoup4==4.12.3
-lxml==5.3.0             # fast HTML parser for BeautifulSoup
-playwright==1.47.0      # for JS-heavy pages (if needed later)
+lxml==5.3.0
+cloudscraper==1.2.71        # Cloudflare bypass for NepseAlpha
 
-# ── Scheduling ────────────────────────────────────────────────────
+# ── Scheduling ─────────────────────────────────────────────────────
 apscheduler==3.10.4
 
-# ── Config & env ──────────────────────────────────────────────────
+# ── Config & env ───────────────────────────────────────────────────
 python-dotenv==1.0.1
 pydantic-settings==2.5.2
 pydantic==2.9.2
 
 # ── Data / Technical Analysis ──────────────────────────────────────
 pandas==2.2.3
-pandas-ta==0.3.14b0     # RSI, MACD, Bollinger Bands, ATR, OBV
+pandas-ta==0.3.14b0
 
-# ── LLM (Ollama — local) ──────────────────────────────────────────
-ollama==0.3.3           # official Ollama Python client
+# ── LLM (Ollama — local) ───────────────────────────────────────────
+ollama==0.3.3
 
-# ── Utilities ─────────────────────────────────────────────────────
-python-multipart==0.0.12   # for FastAPI file uploads
+# ── Utilities ──────────────────────────────────────────────────────
+python-multipart==0.0.12
