@@ -4,7 +4,7 @@
 # Mounted at /api/v1 in main.py.
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,8 +16,9 @@ from ..models import (
     AISignal, ScrapeLog, Stock,
     StockFundamentals, StockPrice, TechnicalIndicator,
 )
+from ..scrapers.merolagani import MerolaganiScraper
 
-logger = APIRouter()
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -46,6 +47,102 @@ def get_stock(symbol: str, db: Session = Depends(get_db)):
     return stock
 
 
+@router.post("/stocks/populate")
+async def populate_stocks(db: Session = Depends(get_db)):
+    """
+    Scrape the full NEPSE listing from Merolagani and upsert into the
+    stocks master table.
+
+    - New symbols   → inserted with company name, sector, is_active=True
+    - Existing rows → company / sector updated only when the scraped
+                      value differs and is non-empty
+    - Rows not seen in the scrape → left untouched (no deactivation)
+
+    Returns a summary: { inserted, updated, unchanged, total, errors }
+    """
+    scraper = MerolaganiScraper()
+    scrape_errors: list[str] = []
+
+    try:
+        stocks_data = await scraper.scrape_all_stocks()
+    except Exception as e:
+        logger.error(f"[populate_stocks] Scraper failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Scraper error: {e}")
+    finally:
+        await scraper.close()
+
+    if not stocks_data:
+        raise HTTPException(
+            status_code=502,
+            detail="Scraper returned no stocks — Merolagani listing page may be unreachable.",
+        )
+
+    inserted  = 0
+    updated   = 0
+    unchanged = 0
+
+    for item in stocks_data:
+        symbol  = item["symbol"].upper()
+        company = (item.get("company") or "").strip() or None
+        sector  = (item.get("sector")  or "").strip() or None
+
+        try:
+            existing = db.query(Stock).filter(Stock.symbol == symbol).first()
+
+            if existing is None:
+                db.add(Stock(
+                    symbol    = symbol,
+                    company   = company,
+                    sector    = sector,
+                    is_active = True,
+                ))
+                inserted += 1
+
+            else:
+                changed = False
+
+                if company and existing.company != company:
+                    existing.company = company
+                    changed = True
+
+                if sector and existing.sector != sector:
+                    existing.sector = sector
+                    changed = True
+
+                if changed:
+                    existing.updated_at = datetime.utcnow()
+                    updated += 1
+                else:
+                    unchanged += 1
+
+        except Exception as e:
+            db.rollback()
+            scrape_errors.append(f"{symbol}: {e}")
+            logger.warning(f"[populate_stocks] Upsert failed for {symbol}: {e}")
+            continue
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[populate_stocks] Final commit failed: {e}")
+        raise HTTPException(status_code=500, detail=f"DB commit failed: {e}")
+
+    logger.info(
+        f"[populate_stocks] Done — "
+        f"inserted={inserted} updated={updated} unchanged={unchanged} "
+        f"errors={len(scrape_errors)}"
+    )
+
+    return {
+        "inserted":  inserted,
+        "updated":   updated,
+        "unchanged": unchanged,
+        "total":     len(stocks_data),
+        "errors":    scrape_errors,
+    }
+
+
 @router.get("/sectors")
 def list_sectors(db: Session = Depends(get_db)):
     """Return all distinct sectors for the sidebar filter."""
@@ -69,7 +166,6 @@ def latest_prices(
     Optionally filter by sector.
     """
     try:
-        # Use the view we created in db_setup.sql
         sql = "SELECT * FROM vw_latest_prices"
         params = {}
         if sector:
@@ -80,7 +176,6 @@ def latest_prices(
         cols   = result.keys()
         return [dict(zip(cols, row)) for row in result.fetchall()]
     except Exception:
-        # Fallback if view doesn't exist yet — query table directly
         q = (
             db.query(StockPrice)
             .order_by(StockPrice.symbol, desc(StockPrice.trade_date))
@@ -98,7 +193,6 @@ def price_history(
 ):
     """
     Return daily OHLCV history for one symbol.
-    `days` controls how far back to go (default 30, max 365).
     Used by the stock detail candlestick chart.
     """
     rows = (
@@ -165,7 +259,6 @@ def latest_signals(
     """
     Return the most recent AI signal for every stock.
     Optionally filter by signal type (BUY / SELL / HOLD).
-    Used by the signals panel on the dashboard.
     """
     try:
         sql = "SELECT * FROM vw_latest_signals"
@@ -204,7 +297,7 @@ def signal_history(
     limit: int = Query(default=30, le=90),
     db: Session = Depends(get_db),
 ):
-    """Return past AI signals for one symbol (for the signal history chart)."""
+    """Return past AI signals for one symbol."""
     return (
         db.query(AISignal)
         .filter(AISignal.symbol == symbol.upper())
@@ -237,7 +330,6 @@ def scrape_status(db: Session = Depends(get_db)):
     """
     Return a quick summary: last successful run time, total stocks tracked,
     and whether data is fresh (scraped today).
-    Used by the status indicator in the nav bar.
     """
     latest_log = (
         db.query(ScrapeLog)
@@ -254,9 +346,9 @@ def scrape_status(db: Session = Depends(get_db)):
     )
 
     return {
-        "last_scrape":    latest_log.finished_at.isoformat() if latest_log else None,
-        "is_fresh":       today_records > 0,
-        "today_records":  today_records,
-        "total_stocks":   total_stocks,
-        "total_prices":   total_prices,
+        "last_scrape":   latest_log.finished_at.isoformat() if latest_log else None,
+        "is_fresh":      today_records > 0,
+        "today_records": today_records,
+        "total_stocks":  total_stocks,
+        "total_prices":  total_prices,
     }
