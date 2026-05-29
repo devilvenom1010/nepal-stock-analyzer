@@ -74,32 +74,104 @@ class SharesansarScraper(BaseScraper):
 
         target_start = date.today() - timedelta(days=days)
         records: list[dict] = []
-        page = 1
+
+        # Step 1: GET the company page to establish session/cookies and extract CSRF token
+        url_get = f"{self.BASE_URL}/company/{symbol.upper()}"
+        soup_get = await self.fetch(url_get)
+        if not soup_get:
+            logger.error(f"[sharesansar] Failed to fetch company page for {symbol} to obtain CSRF token")
+            return []
+
+        # Extract CSRF token
+        token = None
+        meta_token = soup_get.find("meta", {"name": "_token"}) or soup_get.find("meta", {"name": "csrf-token"})
+        if meta_token:
+            token = meta_token.get("content")
+        if not token:
+            input_token = soup_get.find("input", {"name": "_token"})
+            if input_token:
+                token = input_token.get("value")
+
+        if not token:
+            logger.error(f"[sharesansar] Could not find CSRF token on company page for {symbol}")
+            return []
+
+        # Step 2: POST paginated requests to company-price-history
+        url_post = f"{self.BASE_URL}/company-price-history"
+        post_headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-TOKEN": token,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": self.BASE_URL,
+            "Referer": url_get
+        }
+
+        import asyncio
+        start = 0
+        length = 50
+        draw = 1
 
         while True:
-            url  = f"{self.BASE_URL}/ajaxcompanypricehistory?page={page}&companyid={company_id}"
-            soup = await self.fetch(url)
-            if not soup:
-                break
+            form_data = {
+                "_token": token,
+                "draw": str(draw),
+                "start": str(start),
+                "length": str(length),
+                "company": str(company_id)
+            }
 
-            text         = soup.get_text(separator="\n")
-            page_records = _try_parse_json(text, symbol, self.SOURCE_NAME)
-            if page_records is None:
-                page_records = _parse_html_price_table(soup, symbol, self.SOURCE_NAME)
-            if not page_records:
-                break
-
-            records.extend(page_records)
-
-            oldest = page_records[-1].get("date", "")
             try:
-                if date.fromisoformat(oldest) <= target_start:
+                response = await self.client.post(url_post, data=form_data, headers=post_headers)
+                if response.status_code != 200:
+                    logger.warning(f"[sharesansar] POST returned {response.status_code} for {symbol} at start {start}")
                     break
-            except ValueError:
-                break
 
-            page += 1
-            if page > 20:
+                data = response.json()
+                rows = data.get("data") or []
+                if not rows:
+                    break
+
+                page_records = []
+                for r in rows:
+                    d = r.get("published_date") or r.get("date")
+                    if not d:
+                        continue
+                    page_records.append({
+                        "symbol": symbol.upper(),
+                        "date":   d,
+                        "open":   _pf(r.get("open_price") or r.get("open")),
+                        "high":   _pf(r.get("high_price") or r.get("high")),
+                        "low":    _pf(r.get("low_price") or r.get("low")),
+                        "close":  _pf(r.get("close_price") or r.get("close") or r.get("closing_price")),
+                        "volume": _pf(r.get("total_traded_quantity") or r.get("traded_quantity") or r.get("volume") or r.get("vol")),
+                        "source": self.SOURCE_NAME,
+                    })
+
+                if not page_records:
+                    break
+
+                records.extend(page_records)
+
+                # Check if we have fetched beyond the target start date
+                oldest = page_records[-1].get("date", "")
+                try:
+                    if date.fromisoformat(oldest) <= target_start:
+                        break
+                except ValueError:
+                    break
+
+                # Check if there are no more records to fetch
+                records_total = data.get("recordsTotal")
+                if records_total is not None and start + length >= int(records_total):
+                    break
+
+                start += length
+                draw += 1
+                await asyncio.sleep(0.3)
+
+            except Exception as e:
+                logger.error(f"[sharesansar] Exception during historical POST for {symbol} at start {start}: {e}")
                 break
 
         cutoff  = target_start.isoformat()
@@ -112,7 +184,7 @@ class SharesansarScraper(BaseScraper):
     # ------------------------------------------------------------------ #
 
     async def _resolve_company_id(self, symbol: str) -> Optional[int]:
-        sym = symbol.upper()
+        sym = symbol.upper().strip()
 
         # 1. Memory cache
         if sym in self._id_cache:
@@ -123,19 +195,52 @@ class SharesansarScraper(BaseScraper):
             self._id_cache[sym] = _KNOWN_IDS[sym]
             return _KNOWN_IDS[sym]
 
-        # 3. Try to extract from /company/{SYMBOL} page using many patterns
+        # 3. If cache is empty or symbol not found, try building the full map from /company/NABIL
+        if not self._id_cache or len(self._id_cache) <= len(_KNOWN_IDS):
+            await self._build_id_map_from_company_page()
+            if sym in self._id_cache:
+                return self._id_cache[sym]
+
+        # 4. Try to extract from individual /company/{SYMBOL} page using many patterns
         cid = await self._scrape_id_from_company_page(sym)
         if cid:
             self._id_cache[sym] = cid
             logger.debug(f"[sharesansar] Resolved {sym} → ID {cid}")
             return cid
 
-        # 4. Try building the map from today's table (scans all href links)
+        # 5. Try building the map from today's table (scans all href links)
         await self._build_id_map_from_today_table()
         if sym in self._id_cache:
             return self._id_cache[sym]
 
         return None
+
+    async def _build_id_map_from_company_page(self) -> None:
+        """
+        Hit /company/NABIL and parse 'var cmpjson = [...]' script to bulk-populate the ID cache.
+        """
+        url = f"{self.BASE_URL}/company/NABIL"
+        soup = await self.fetch(url)
+        if not soup:
+            return
+
+        import json
+        for script in soup.find_all("script"):
+            content = script.string or ""
+            if "var cmpjson =" in content:
+                match = re.search(r"var\s+cmpjson\s*=\s*(\[.*?\]);", content, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        for item in data:
+                            sym = item.get("symbol", "").upper().strip()
+                            cid = item.get("id")
+                            if sym and cid:
+                                self._id_cache[sym] = int(cid)
+                        logger.info(f"[sharesansar] Dynamically resolved {len(data)} company IDs from cmpjson")
+                        return
+                    except Exception as e:
+                        logger.warning(f"[sharesansar] Failed to parse cmpjson from script block: {e}")
 
     async def _scrape_id_from_company_page(self, symbol: str) -> Optional[int]:
         """

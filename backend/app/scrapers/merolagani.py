@@ -253,12 +253,20 @@ class MerolaganiScraper(BaseScraper):
 
     async def scrape_historical(self, symbol: str, days: int = 30) -> list[dict]:
         """Scrape historical OHLCV for a symbol."""
+        from datetime import datetime
+        import time
+        
         start, end = self.date_range(days)
+        start_dt = datetime.combine(start, datetime.min.time())
+        end_dt = datetime.combine(end, datetime.max.time())
+        start_ts = int(time.mktime(start_dt.timetuple()))
+        end_ts = int(time.mktime(end_dt.timetuple()))
+        
         url = (
             f"{self.BASE_URL}/handlers/TechnicalChartHandler.ashx"
-            f"?type=full&symbol={symbol}"
-            f"&from={start.strftime('%m/%d/%Y')}"
-            f"&to={end.strftime('%m/%d/%Y')}"
+            f"?type=get_advanced_chart&symbol={symbol.upper()}&resolution=1D"
+            f"&rangeStartDate={start_ts}&rangeEndDate={end_ts}"
+            f"&isAdjust=1&currencyCode=NPR"
         )
         soup = await self.fetch(url)
         if not soup:
@@ -267,25 +275,56 @@ class MerolaganiScraper(BaseScraper):
         records = []
         try:
             import json
-            data = json.loads(soup.get_text())
-            for item in data:
-                records.append({
-                    "symbol": symbol,
-                    "date":   item.get("d"),
-                    "open":   item.get("o"),
-                    "high":   item.get("h"),
-                    "low":    item.get("l"),
-                    "close":  item.get("c"),
-                    "volume": item.get("v"),
-                    "source": self.SOURCE_NAME,
-                })
+            text = soup.get_text().strip()
+            # Safety check: if response is not valid JSON, log warning and return gracefully
+            if not (text.startswith("[") or text.startswith("{")):
+                logger.debug(f"[merolagani] No valid chart data for {symbol} (response is not JSON)")
+                return []
+
+            data = json.loads(text)
+            if isinstance(data, dict) and "t" in data and "c" in data:
+                timestamps = data.get("t") or []
+                opens = data.get("o") or []
+                highs = data.get("h") or []
+                lows = data.get("l") or []
+                closes = data.get("c") or []
+                volumes = data.get("v") or []
+                
+                for i in range(len(timestamps)):
+                    dt_str = datetime.fromtimestamp(timestamps[i]).date().isoformat()
+                    records.append({
+                        "symbol": symbol.upper(),
+                        "date":   dt_str,
+                        "open":   opens[i] if i < len(opens) else None,
+                        "high":   highs[i] if i < len(highs) else None,
+                        "low":    lows[i] if i < len(lows) else None,
+                        "close":  closes[i] if i < len(closes) else None,
+                        "volume": volumes[i] if i < len(volumes) else None,
+                        "source": self.SOURCE_NAME,
+                    })
+            elif isinstance(data, list):
+                # Legacy array format
+                for item in data:
+                    records.append({
+                        "symbol": symbol,
+                        "date":   item.get("d"),
+                        "open":   item.get("o"),
+                        "high":   item.get("h"),
+                        "low":    item.get("l"),
+                        "close":  item.get("c"),
+                        "volume": item.get("v"),
+                        "source": self.SOURCE_NAME,
+                    })
+            else:
+                logger.debug(f"[merolagani] No valid chart data for {symbol} (response status: {data.get('s')})")
         except Exception as e:
             logger.error(f"[merolagani] Parse error for {symbol}: {e}")
         return records
 
     async def scrape_daily(self, symbol: str) -> Optional[dict]:
         """Scrape today's snapshot for a single symbol."""
-        # 1. Try to read from the cached StockQuote table first (fast, complete, handles pct_change)
+        # 1. Try to read from the cached StockQuote table first
+        cached_stock = None
         if not self._today_cache:
             try:
                 await self.scrape_all_stocks(resolve_sectors=False)
@@ -294,13 +333,14 @@ class MerolaganiScraper(BaseScraper):
 
         for s in self._today_cache:
             if s["symbol"].upper() == symbol.upper():
-                return s
+                cached_stock = s.copy()
+                break
 
-        # 2. Fallback: individual company detail page
+        # 2. Scrape individual company detail page to extract fundamentals
         url = f"{self.BASE_URL}/CompanyDetail.aspx?symbol={symbol}"
         soup = await self.fetch(url)
         if not soup:
-            return None
+            return cached_stock
 
         try:
             # Close price
@@ -326,29 +366,66 @@ class MerolaganiScraper(BaseScraper):
                 "source":     self.SOURCE_NAME,
             }
 
-            stats = soup.find("div", {"class": "company-stats"})
-            if stats:
-                rows = {
-                    r.find_all("td")[0].text.strip(): r.find_all("td")[1].text.strip()
-                    for r in stats.find_all("tr")
-                    if len(r.find_all("td")) >= 2
-                }
+            table = soup.find("table", {"class": "table-zeromargin"})
+            if table:
+                rows = {}
+                for tbody in table.find_all("tbody"):
+                    cls = tbody.get("class") or []
+                    if "panel" in cls:
+                        tr = tbody.find("tr")
+                        if tr:
+                            th = tr.find("th")
+                            td = tr.find("td")
+                            if th and td:
+                                label = th.get_text(strip=True)
+                                val = td.get_text(strip=True)
+                                rows[label] = val
+                
+                # Dynamic parsing helpers
+                def clean_num(val_str):
+                    if not val_str: return None
+                    m = re.match(r"^\s*([Rs.\d,\-\s]+)", str(val_str))
+                    if m:
+                        cleaned = m.group(1).replace(",", "").replace("Rs.", "").strip()
+                        try:
+                            return float(cleaned) if cleaned else None
+                        except ValueError:
+                            return None
+                    return None
+
+                val_52 = rows.get("52 Weeks High - Low")
+                week52_high = None
+                week52_low = None
+                if val_52 and "-" in val_52:
+                    parts = val_52.split("-")
+                    if len(parts) >= 2:
+                        week52_high = clean_num(parts[0])
+                        week52_low = clean_num(parts[1])
+
                 result.update({
-                    "open":        _parse_float(rows.get("Open")),
-                    "high":        _parse_float(rows.get("High")),
-                    "low":         _parse_float(rows.get("Low")),
-                    "volume":      _parse_float(rows.get("Volume")),
-                    "market_cap":  _parse_float(rows.get("Market Capitalization")),
-                    "pe_ratio":    _parse_float(rows.get("P/E Ratio")),
-                    "week52_high": _parse_float(rows.get("52 Weeks High")),
-                    "week52_low":  _parse_float(rows.get("52 Weeks Low")),
-                    "eps":         _parse_float(rows.get("EPS")),
-                    "book_value":  _parse_float(rows.get("Book Value")),
+                    "open":        clean_num(rows.get("Open")),
+                    "high":        clean_num(rows.get("High")),
+                    "low":         clean_num(rows.get("Low")),
+                    "volume":      clean_num(rows.get("Volume")),
+                    "market_cap":  clean_num(rows.get("Market Capitalization")),
+                    "pe_ratio":    clean_num(rows.get("P/E Ratio")),
+                    "week52_high": week52_high,
+                    "week52_low":  week52_low,
+                    "eps":         clean_num(rows.get("EPS")),
+                    "book_value":  clean_num(rows.get("Book Value")),
                 })
+
+            if cached_stock:
+                # Merge cached daily price info with scraped fundamentals
+                for k in ["market_cap", "pe_ratio", "eps", "book_value", "week52_high", "week52_low"]:
+                    if k in result:
+                        cached_stock[k] = result[k]
+                return cached_stock
+            
             return result
         except Exception as e:
             logger.error(f"[merolagani] Daily scrape fallback error for {symbol}: {e}")
-            return None
+            return cached_stock
 
 
 # ─────────────────────────────────────────────────────────────────

@@ -262,22 +262,46 @@ def _upsert_fundamentals(db: Session, data: dict) -> None:
     fund_keys = ["market_cap", "pe_ratio", "eps", "book_value", "week52_high", "week52_low"]
     if not any(data.get(k) for k in fund_keys):
         return
+    sym = data["symbol"].upper()
+    t_date = _to_date(data["date"])
     try:
-        row = StockFundamentals(
-            symbol      = data["symbol"].upper(),
-            trade_date  = _to_date(data["date"]),
-            market_cap  = data.get("market_cap"),
-            pe_ratio    = data.get("pe_ratio"),
-            eps         = data.get("eps"),
-            book_value  = data.get("book_value"),
-            week52_high = data.get("week52_high"),
-            week52_low  = data.get("week52_low"),
-            source      = data.get("source"),
-        )
-        db.add(row)
+        existing = db.query(StockFundamentals).filter(
+            StockFundamentals.symbol == sym,
+            StockFundamentals.trade_date == t_date
+        ).first()
+
+        if existing:
+            if data.get("market_cap") is not None:
+                existing.market_cap = data.get("market_cap")
+            if data.get("pe_ratio") is not None:
+                existing.pe_ratio = data.get("pe_ratio")
+            if data.get("eps") is not None:
+                existing.eps = data.get("eps")
+            if data.get("book_value") is not None:
+                existing.book_value = data.get("book_value")
+            if data.get("week52_high") is not None:
+                existing.week52_high = data.get("week52_high")
+            if data.get("week52_low") is not None:
+                existing.week52_low = data.get("week52_low")
+            if data.get("source"):
+                existing.source = data.get("source")
+        else:
+            row = StockFundamentals(
+                symbol      = sym,
+                trade_date  = t_date,
+                market_cap  = data.get("market_cap"),
+                pe_ratio    = data.get("pe_ratio"),
+                eps         = data.get("eps"),
+                book_value  = data.get("book_value"),
+                week52_high = data.get("week52_high"),
+                week52_low  = data.get("week52_low"),
+                source      = data.get("source"),
+            )
+            db.add(row)
         db.flush()
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.warning(f"[_upsert_fundamentals] Failed to upsert fundamentals for {sym} on {t_date}: {e}")
 
 
 def _price_exists(db: Session, symbol: str, date_str: str) -> bool:
